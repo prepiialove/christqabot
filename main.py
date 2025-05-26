@@ -25,6 +25,8 @@ TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHANNEL_ID = os.getenv('CHANNEL_ID')  # Публичный канал для ответов
 ADMIN_GROUP_ID = os.getenv('ADMIN_GROUP_ID')  # Приватная группа для админов
 ADMIN_IDS = [int(id_) for id_ in os.getenv('ADMIN_IDS', '').split(',') if id_]
+BOT_MODE = os.getenv('BOT_MODE', 'polling')
+WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')
 
 # Категории вопросов
 CATEGORIES: Dict[str, str] = {
@@ -1152,76 +1154,52 @@ def main():
             print("❌ Некорректный формат ADMIN_GROUP_ID")
             return
 
-        # Инициализация бота
-        application = Application.builder().token(os.getenv('TELEGRAM_TOKEN')).build()
+        # Создаем приложение
+        application = Application.builder().token(TOKEN).build()
 
-        # Сначала добавляем обработчики для админского меню
-        admin_menu_handlers = [
-            MessageHandler(filters.Regex("^📥 Нові питання$"), handle_admin_menu),
-            MessageHandler(filters.Regex("^⭐️ Важливі питання$"), handle_admin_menu),
-            MessageHandler(filters.Regex("^✅ Опрацьовані$"), handle_admin_menu),
-            MessageHandler(filters.Regex("^❌ Відхилені$"), handle_admin_menu),
-            MessageHandler(filters.Regex("^🔄 Змінити відповідь$"), handle_admin_menu),
-            MessageHandler(filters.Regex("^📊 Статистика$"), handle_admin_menu)
-        ]
-
-        # Добавляем обработчики для кнопок основного меню
-        main_menu_handlers = [
-            MessageHandler(filters.Regex("^📋 Мої питання$"), show_my_questions),
-            MessageHandler(filters.Regex("^✉️ Мої відповіді$"), show_my_answers),
-            MessageHandler(filters.Regex("^❓ Допомога$"), 
-                lambda update, context: handle_message(update, context)),
-            MessageHandler(filters.Regex("^📢 Канал з відповідями$"), 
-                lambda update, context: handle_message(update, context))
-        ]
-
-        # Сначала добавляем обработчики меню
-        for handler in admin_menu_handlers + main_menu_handlers:
-            application.add_handler(handler)
-
-        # Затем добавляем ConversationHandler
-        conv_handler = ConversationHandler(
-            entry_points=[
-                CommandHandler('start', start),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-            ],
-            states={
-                CHOOSING: [
-                    CallbackQueryHandler(button_handler),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-                ],
-                TYPING_CATEGORY: [
-                    CallbackQueryHandler(button_handler),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-                ],
-                TYPING_QUESTION: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_regular_message),
-                    CallbackQueryHandler(button_handler)
-                ],
-                TYPING_REPLY: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_regular_message),
-                    CallbackQueryHandler(button_handler)
-                ]
-            },
-            fallbacks=[CommandHandler('cancel', cancel)],
-            name="main_conversation",
-            persistent=False
-        )
-
-        application.add_handler(conv_handler)
-
-        # В конце добавляем обработчик для callback_query
+        # Добавляем обработчики
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("cancel", cancel))
+        application.add_handler(CommandHandler("stats", show_stats))
+        
+        # Добавляем обработчик для админского меню
+        application.add_handler(MessageHandler(filters.Regex("^(📥 Нові питання|⭐️ Важливі питання|✅ Опрацьовані|❌ Відхилені|🔄 Змінити відповідь|📊 Статистика)$"), handle_admin_menu))
+        
+        # Добавляем обработчик для обычных сообщений
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        
+        # Добавляем обработчик для callback-запросов
         application.add_handler(CallbackQueryHandler(button_handler))
 
         print("🚀 Бот запущено!")
         logger.info("Бот запущен и готов к работе")
         
         # Запускаем бота
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        if BOT_MODE == 'webhook' and WEBHOOK_URL:
+            application.run_webhook(
+                listen='0.0.0.0',
+                port=int(os.getenv('PORT', 8080)),
+                webhook_url=WEBHOOK_URL
+            )
+        else:
+            application.run_polling()
 
     except Exception as e:
         logger.error(f"Помилка при запуску бота: {e}")
         print(f"❌ Помилка при запуску бота: {e}")
+
+# Для gunicorn
+app = Application.builder().token(TOKEN).build()
+
+# Добавляем обработчики
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("help", help_command))
+app.add_handler(CommandHandler("cancel", cancel))
+app.add_handler(CommandHandler("stats", show_stats))
+app.add_handler(MessageHandler(filters.Regex("^(📥 Нові питання|⭐️ Важливі питання|✅ Опрацьовані|❌ Відхилені|🔄 Змінити відповідь|📊 Статистика)$"), handle_admin_menu))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+app.add_handler(CallbackQueryHandler(button_handler))
 
 if __name__ == '__main__':
     main() 
