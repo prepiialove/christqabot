@@ -1,0 +1,657 @@
+Ось детальний посібник для створення та розгортання вашого Telegram-бота для анонімних питань на Google Cloud Run. Я, MANUS AI, проведу вас через усі етапи: від підготовки коду до публікації та тестування. Ми використаємо ваш код, адаптуємо його для роботи з Webhook на Google Cloud Run і розгорнемо його. Почнемо!
+
+---
+
+## Огляд проєкту
+
+Ваш бот дозволяє користувачам анонімно задавати питання, які обробляються адміністраторами в приватній групі, а відповіді публікуються в публічному каналі. Ми використаємо ваш токен, канал `@christ_qa`, групу адмінів `-1002576988593` та ID адміністратора `404389668`.
+
+---
+
+## Попередні вимоги
+
+Перед початком переконайтеся, що у вас є:
+
+1. **Аккаунт Google Cloud**:
+   - Зареєструйтеся на [Google Cloud](https://cloud.google.com/) і активуйте безкоштовний кредит ($300), якщо це ваш перший проєкт.
+2. **Google Cloud SDK**:
+   - Встановіть [Google Cloud SDK](https://cloud.google.com/sdk/docs/install).
+3. **Git**:
+   - Встановіть [Git](https://git-scm.com/downloads).
+4. **Python 3.9+**:
+   - Переконайтеся, що у вас встановлено Python 3.9 або новішу версію.
+5. **Telegram Bot Token**:
+   - Ваш токен: `7540984242:AAHwnXjpUHjmV4bjCeKgTq7YR0_9fVC_OHs`.
+6. **Канал і група в Telegram**:
+   - Публічний канал: `@christ_qa`.
+   - Приватна група адмінів: `-1002576988593`.
+   - ID адміністратора: `404389668`.
+
+---
+
+## Крок 1: Підготовка проєкту
+
+### 1.1. Створення робочої директорії
+
+Створіть директорію для проєкту та перейдіть у неї:
+
+```bash
+mkdir telegram-qa-bot
+cd telegram-qa-bot
+```
+
+### 1.2. Ініціалізація Git
+
+Ініціалізуйте Git-репозиторій:
+
+```bash
+git init
+```
+
+### 1.3. Створення основних файлів
+
+#### **bot.py**
+Ось адаптована версія вашого коду для роботи з Webhook на Google Cloud Run. Скопіюйте її в файл `bot.py`:
+
+```python
+import os
+import logging
+import json
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, Filters, ContextTypes, CallbackQueryHandler, ConversationHandler
+from dotenv import load_dotenv
+from typing import Dict, List
+import asyncio
+from aiohttp import web
+
+# Налаштування логування
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Завантаження змінних оточення
+load_dotenv()
+
+# Константи для ConversationHandler
+CHOOSING, TYPING_QUESTION, TYPING_CATEGORY, TYPING_REPLY = range(4)
+
+# Змінні оточення
+TOKEN = os.getenv('TELEGRAM_TOKEN')
+CHANNEL_ID = os.getenv('CHANNEL_ID')
+ADMIN_GROUP_ID = os.getenv('ADMIN_GROUP_ID')
+ADMIN_IDS = [int(id_) for id_ in os.getenv('ADMIN_IDS', '').split(',') if id_]
+
+# Категорії питань
+CATEGORIES: Dict[str, str] = {
+    'general': '🌟 Загальні',
+    'spiritual': '🙏 Духовні',
+    'personal': '👤 Особисті',
+    'urgent': '⚡️ Термінові'
+}
+
+# Ініціалізація бота
+application = Application.builder().token(TOKEN).build()
+
+class Database:
+    def __init__(self, filename='db.json'):
+        self.filename = filename
+        self.questions = {}
+        self.stats = {
+            'total_questions': 0,
+            'answered_questions': 0,
+            'categories': {}
+        }
+        self.load()
+
+    def load(self):
+        try:
+            if os.path.exists(self.filename):
+                with open(self.filename, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.questions = data.get('questions', {})
+                    self.stats = data.get('stats', {
+                        'total_questions': 0,
+                        'answered_questions': 0,
+                        'categories': {}
+                    })
+        except Exception as e:
+            logger.error(f"Помилка при завантаженні бази даних: {e}")
+
+    def save(self):
+        try:
+            with open(self.filename, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'questions': self.questions,
+                    'stats': self.stats
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Помилка при збереженні бази даних: {e}")
+
+    def add_question(self, question_id: str, question_data: dict):
+        self.questions[question_id] = question_data
+        self.stats['total_questions'] += 1
+        category = question_data.get('category')
+        if category:
+            self.stats['categories'][category] = self.stats['categories'].get(category, 0) + 1
+        self.save()
+
+    def update_question(self, question_id: str, update_data: dict):
+        if question_id in self.questions:
+            self.questions[question_id].update(update_data)
+            if update_data.get('status') == 'answered':
+                self.stats['answered_questions'] += 1
+            self.save()
+
+    def get_question(self, question_id: str) -> dict:
+        return self.questions.get(question_id, {})
+
+# Ініціалізація бази даних
+db = Database()
+
+def get_main_keyboard():
+    keyboard = [
+        ["📝 Задати питання"],
+        ["📋 Мої питання", "✉️ Мої відповіді"],
+        ["❓ Допомога"],
+        [f"📢 Канал з відповідями"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_category_keyboard():
+    keyboard = []
+    for cat_id, name in CATEGORIES.items():
+        keyboard.append([InlineKeyboardButton(text=name, callback_data=f"cat_{cat_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_keyboard(question_id: str):
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Відповісти", callback_data=f"answer_{question_id}"),
+            InlineKeyboardButton("❌ Відхилити", callback_data=f"reject_{question_id}")
+        ],
+        [
+            InlineKeyboardButton("⭐️ Важливе", callback_data=f"important_{question_id}"),
+            InlineKeyboardButton("📌 Закріпити", callback_data=f"pin_{question_id}")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    logger.info(f"Користувач {user.id} запустив бота")
+    if update.effective_chat.type == 'private':
+        welcome_text = (
+            f"👋 Вітаю, {user.first_name}!\n\n"
+            "🤖 Це бот для анонімних питань.\n\n"
+            "📝 Ви можете:\n"
+            "• Задавати питання анонімно\n"
+            "• Переглядати свої питання\n"
+            "• Отримувати відповіді в каналі\n\n"
+            "❗️ Всі питання повністю анонімні\n"
+            "✅ Відповіді публікуються в каналі"
+        )
+        await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard())
+    return CHOOSING
+
+async def webhook(request):
+    try:
+        update = Update.de_json(await request.json(), application.bot)
+        await application.process_update(update)
+        return web.Response(status=200)
+    except Exception as e:
+        logger.error(f"Помилка в Webhook: {e}")
+        return web.Response(status=500)
+
+async def start_server():
+    app = web.Application()
+    app.router.add_post('/webhook', webhook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
+
+def main():
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('start', start),
+            MessageHandler(Filters.text & ~Filters.command, handle_message)
+        ],
+        states={
+            CHOOSING: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(Filters.text & ~Filters.command, handle_message)
+            ],
+            TYPING_CATEGORY: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(Filters.text & ~Filters.command, handle_message)
+            ],
+            TYPING_QUESTION: [
+                MessageHandler(Filters.text & ~Filters.command, handle_regular_message),
+                CallbackQueryHandler(button_handler)
+            ],
+            TYPING_REPLY: [
+                MessageHandler(Filters.text & ~Filters.command, handle_regular_message),
+                CallbackQueryHandler(button_handler)
+            ]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(button_handler))
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(start_server())
+    logger.info("Сервер запущено на порту 8080")
+    loop.run_forever()
+
+if __name__ == "__main__":
+    main()
+
+# Додайте решту функцій з вашого оригінального коду нижче:
+
+def get_admin_menu_keyboard():
+    keyboard = [
+        ["📥 Нові питання", "⭐️ Важливі питання"],
+        ["✅ Опрацьовані", "❌ Відхилені"],
+        ["🔄 Змінити відповідь", "📊 Статистика"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_questions_list_keyboard(questions: List[dict], page: int = 0, items_per_page: int = 5):
+    keyboard = []
+    start_idx = page * items_per_page
+    end_idx = start_idx + items_per_page
+    
+    for q in questions[start_idx:end_idx]:
+        status_emoji = {'pending': '⏳', 'answered': '✅', 'rejected': '❌'}.get(q['status'], '⏳')
+        short_text = q['text'][:30] + '...' if len(q['text']) > 30 else q['text']
+        keyboard.append([InlineKeyboardButton(f"{status_emoji} {CATEGORIES[q['category']]}: {short_text}", callback_data=f"view_q_{q['id']}")])
+        if q['status'] == 'rejected':
+            keyboard.append([InlineKeyboardButton("↩️ Відновити", callback_data=f"restore_{q['id']}")])
+    
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"page_{page-1}"))
+    if end_idx < len(questions):
+        nav_buttons.append(InlineKeyboardButton("➡️ Вперед", callback_data=f"page_{page+1}"))
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+    
+    keyboard.append([InlineKeyboardButton("🔙 В меню админа", callback_data="admin_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Дію скасовано.\nОберіть нову дію:", reply_markup=get_main_keyboard())
+    return CHOOSING
+
+async def show_my_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_questions = [q for q_id, q in db.questions.items() if q.get('user_id') == user_id]
+    
+    if not user_questions:
+        await update.message.reply_text("📝 У вас поки немає питань.", reply_markup=get_main_keyboard())
+        return CHOOSING
+    
+    questions_text = "📋 Ваші питання:\n\n"
+    for i, q in enumerate(user_questions, 1):
+        status = {'pending': '⏳ Очікує', 'answered': '✅ Відповідь', 'rejected': '❌ Відхилено'}.get(q['status'], '⏳ Очікує')
+        questions_text += f"{i}. {CATEGORIES[q['category']]}\nПитання: {q['text']}\nСтатус: {status}\n\n"
+    
+    await update.message.reply_text(questions_text, reply_markup=get_main_keyboard())
+    return CHOOSING
+
+async def show_my_answers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    answered_questions = [q for q_id, q in db.questions.items() if q.get('user_id') == user_id and q.get('status') == 'answered']
+    
+    if not answered_questions:
+        await update.message.reply_text("📝 У вас поки немає відповідей.", reply_markup=get_main_keyboard())
+        return CHOOSING
+    
+    answers_text = "✉️ Ваші відповіді:\n\n"
+    for i, q in enumerate(answered_questions, 1):
+        answers_text += f"{i}. {CATEGORIES[q['category']]}\nПитання: {q['text']}\nВідповідь: {q.get('answer', '')}\n\n"
+    
+    await update.message.reply_text(answers_text, reply_markup=get_main_keyboard())
+    return CHOOSING
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    is_admin = user_id in ADMIN_IDS
+
+    if update.effective_chat.type == 'private':
+        if text == "📝 Задати питання":
+            await update.message.reply_text("📝 Оберіть категорію:", reply_markup=get_category_keyboard())
+            return TYPING_CATEGORY
+        elif text == "📋 Мої питання":
+            return await show_my_questions(update, context)
+        elif text == "✉️ Мої відповіді":
+            return await show_my_answers(update, context)
+        elif text == "❓ Допомога":
+            help_text = (
+                "📌 Як користуватися:\n"
+                "1️⃣ Натисніть '📝 Задати питання'\n"
+                "2️⃣ Оберіть категорію\n"
+                "3️⃣ Напишіть питання\n"
+                "Відповіді з’являться в каналі."
+            )
+            await update.message.reply_text(help_text)
+            return CHOOSING
+        elif text == "📢 Канал з відповідями":
+            await update.message.reply_text(
+                "Перейдіть у канал:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 Канал", url=f"https://t.me/{CHANNEL_ID.lstrip('@')}")]])
+            )
+            return CHOOSING
+        elif is_admin and text in ["📥 Нові питання", "⭐️ Важливі питання", "✅ Опрацьовані", "❌ Відхилені", "🔄 Змінити відповідь", "📊 Статистика"]:
+            return await handle_admin_menu(update, context)
+        else:
+            keyboard = get_admin_menu_keyboard() if is_admin else get_main_keyboard()
+            await update.message.reply_text("Оберіть опцію:", reply_markup=keyboard)
+            return CHOOSING
+    return await handle_regular_message(update, context)
+
+async def handle_regular_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    message_text = update.message.text
+
+    if context.user_data.get('answering') and user_id in ADMIN_IDS:
+        question_id = context.user_data['answering']
+        question = db.questions[question_id]
+        answer_text = message_text
+        message_text = f"❓ {CATEGORIES[question['category']]}\n\n{question['text']}\n\n✅ Відповідь:\n{answer_text}"
+        message = await context.bot.send_message(chat_id=CHANNEL_ID, text=message_text)
+        db.update_question(question_id, {
+            'status': 'answered',
+            'answer': answer_text,
+            'answer_time': datetime.now().isoformat(),
+            'answer_message_id': message.message_id
+        })
+        context.user_data.clear()
+        await update.message.reply_text("✅ Відповідь опубліковано", reply_markup=get_admin_menu_keyboard())
+        return CHOOSING
+
+    elif context.user_data.get('category') and context.user_data.get('waiting_for_question'):
+        category = context.user_data['category']
+        question_id = f"q{len(db.questions) + 1}"
+        db.add_question(question_id, {
+            'id': question_id,
+            'category': category,
+            'text': message_text,
+            'status': 'pending',
+            'time': datetime.now().isoformat(),
+            'important': False,
+            'user_id': user_id
+        })
+        await handle_admin_question(update, context, question_id)
+        context.user_data.clear()
+        await update.message.reply_text("✅ Питання надіслано!", reply_markup=get_main_keyboard())
+        return CHOOSING
+
+    else:
+        await update.message.reply_text("❗️ Використовуйте кнопки.", reply_markup=get_main_keyboard())
+        return CHOOSING
+
+async def handle_admin_question(update: Update, context: ContextTypes.DEFAULT_TYPE, question_id: str):
+    question = db.questions[question_id]
+    message_text = f"📨 Нове питання\n\nКатегорія: {CATEGORIES[question['category']]}\nПитання: {question['text']}"
+    await context.bot.send_message(chat_id=int(ADMIN_GROUP_ID), text=message_text, reply_markup=get_admin_keyboard(question_id))
+
+async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "📊 Статистика":
+        stats_text = (
+            f"📝 Всього: {db.stats['total_questions']}\n"
+            f"✅ Відповіді: {db.stats['answered_questions']}\n"
+            f"⏳ Очікують: {db.stats['total_questions'] - db.stats['answered_questions']}\n\n"
+            "📊 Категорії:\n"
+        )
+        for cat_id, cat_name in CATEGORIES.items():
+            stats_text += f"{cat_name}: {db.stats['categories'].get(cat_id, 0)}\n"
+        await update.message.reply_text(stats_text, reply_markup=get_admin_menu_keyboard())
+    elif text == "📥 Нові питання":
+        new_questions = [q for q in db.questions.values() if q['status'] == 'pending']
+        if not new_questions:
+            await update.message.reply_text("📭 Немає нових питань", reply_markup=get_admin_menu_keyboard())
+        else:
+            context.user_data['current_questions'] = new_questions
+            context.user_data['current_page'] = 0
+            await update.message.reply_text("📥 Нові питання:", reply_markup=get_questions_list_keyboard(new_questions))
+    return CHOOSING
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data
+    await query.answer()
+
+    if data == "back_to_main":
+        await query.message.edit_text("Оберіть дію:", reply_markup=get_main_keyboard())
+        context.user_data.clear()
+        return CHOOSING
+    elif data.startswith("cat_"):
+        category = data.replace("cat_", "")
+        context.user_data['category'] = category
+        context.user_data['waiting_for_question'] = True
+        await query.message.edit_text(f"📝 {CATEGORIES[category]}\nНапишіть питання:")
+        return TYPING_QUESTION
+    elif data.startswith("answer_"):
+        question_id = data.replace("answer_", "")
+        context.user_data['answering'] = question_id
+        question = db.questions[question_id]
+        await query.message.edit_text(f"✍️ {CATEGORIES[question['category']]}\n{question['text']}\nНапишіть відповідь:")
+        return TYPING_REPLY
+    elif data.startswith("reject_"):
+        question_id = data.replace("reject_", "")
+        db.update_question(question_id, {'status': 'rejected'})
+        await query.message.edit_text(f"❌ Питання відхилено")
+        return CHOOSING
+    elif data.startswith("important_"):
+        question_id = data.replace("important_", "")
+        question = db.questions[question_id]
+        is_important = not question.get('important', False)
+        db.update_question(question_id, {'important': is_important})
+        await query.message.edit_text(f"{'⭐️ Важливе' if is_important else '🔵 Звичайне'}", reply_markup=get_admin_keyboard(question_id))
+        return CHOOSING
+    elif data.startswith("pin_"):
+        question_id = data.replace("pin_", "")
+        await context.bot.pin_chat_message(chat_id=int(ADMIN_GROUP_ID), message_id=query.message.message_id)
+        await query.answer("📌 Закріплено!")
+        return CHOOSING
+    return CHOOSING
+```
+
+#### **requirements.txt**
+Створіть файл із залежностями:
+
+```
+python-telegram-bot==20.8
+python-dotenv==1.0.1
+aiohttp==3.9.5
+```
+
+#### **.env**
+Створіть файл `.env` із вашими даними:
+
+```
+TELEGRAM_TOKEN=7540984242:AAHwnXjpUHjmV4bjCeKgTq7YR0_9fVC_OHs
+CHANNEL_ID=@christ_qa
+ADMIN_GROUP_ID=-1002576988593
+ADMIN_IDS=404389668
+```
+
+#### **Dockerfile**
+Створіть `Dockerfile` для контейнеризації:
+
+```
+FROM python:3.9-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 8080
+CMD ["python", "bot.py"]
+```
+
+#### **.dockerignore**
+Створіть `.dockerignore`:
+
+```
+__pycache__
+*.pyc
+*.pyo
+.env
+```
+
+#### **db.json**
+Створіть початковий файл бази даних:
+
+```json
+{
+  "questions": {},
+  "stats": {
+    "total_questions": 0,
+    "answered_questions": 0,
+    "categories": {
+      "general": 0,
+      "spiritual": 0,
+      "personal": 0,
+      "urgent": 0
+    }
+  }
+}
+```
+
+---
+
+## Крок 2: Налаштування Google Cloud
+
+### 2.1. Авторизація
+
+Увійдіть у Google Cloud:
+
+```bash
+gcloud auth login
+```
+
+### 2.2. Створення проєкту
+
+Створіть проєкт (замініть `telegram-qa-bot-123` на унікальний ID):
+
+```bash
+gcloud projects create telegram-qa-bot-123 --set-as-default
+gcloud config set project telegram-qa-bot-123
+```
+
+### 2.3. Увімкнення API
+
+Увімкніть API:
+
+```bash
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com
+```
+
+### 2.4. Налаштування Artifact Registry
+
+Створіть репозиторій для Docker-образів (використовуйте ваш регіон, наприклад, `europe-west1`):
+
+```bash
+gcloud artifacts repositories create qa-bot-repo --repository-format=docker --location=europe-west1
+```
+
+---
+
+## Крок 3: Сборка та розгортання
+
+### 3.1. Сборка Docker-образу
+
+Побудуйте образ:
+
+```bash
+docker build -t qa-bot .
+```
+
+### 3.2. Тегування та завантаження
+
+Тегніть і завантажте образ (замініть `europe-west1` і `telegram-qa-bot-123`):
+
+```bash
+docker tag qa-bot europe-west1-docker.pkg.dev/telegram-qa-bot-123/qa-bot-repo/qa-bot
+docker push europe-west1-docker.pkg.dev/telegram-qa-bot-123/qa-bot-repo/qa-bot
+```
+
+### 3.3. Розгортання на Google Cloud Run
+
+Розгорніть сервіс:
+
+```bash
+gcloud run deploy telegram-qa-bot \
+  --image europe-west1-docker.pkg.dev/telegram-qa-bot-123/qa-bot-repo/qa-bot \
+  --platform managed \
+  --region europe-west1 \
+  --allow-unauthenticated \
+  --port 8080 \
+  --set-env-vars "TELEGRAM_TOKEN=7540984242:AAHwnXjpUHjmV4bjCeKgTq7YR0_9fVC_OHs,CHANNEL_ID=@christ_qa,ADMIN_GROUP_ID=-1002576988593,ADMIN_IDS=404389668"
+```
+
+---
+
+## Крок 4: Налаштування Webhook
+
+### 4.1. Отримання URL
+
+Отримайте URL сервісу:
+
+```bash
+SERVICE_URL=$(gcloud run services describe telegram-qa-bot --platform managed --region europe-west1 --format 'value(status.url)')
+echo $SERVICE_URL
+```
+
+### 4.2. Встановлення Webhook
+
+Налаштуйте Webhook:
+
+```bash
+curl -F "url=${SERVICE_URL}/webhook" "https://api.telegram.org/bot7540984242:AAHwnXjpUHjmV4bjCeKgTq7YR0_9fVC_OHs/setWebhook"
+```
+
+Перевірте статус:
+
+```bash
+curl "https://api.telegram.org/bot7540984242:AAHwnXjpUHjmV4bjCeKgTq7YR0_9fVC_OHs/getWebhookInfo"
+```
+
+---
+
+## Крок 5: Тестування
+
+1. Напишіть `/start` боту.
+2. Натисніть "📝 Задати питання", оберіть категорію, введіть питання.
+3. Перевірте, чи з’явилось питання в групі `-1002576988593`.
+4. Відповідайте як адміністратор і перевірте публікацію в `@christ_qa`.
+
+---
+
+## Усунення проблем
+
+- **Логи**:
+  ```bash
+  gcloud logging read "resource.type=cloud_run_revision" --project telegram-qa-bot-123
+  ```
+- **Webhook**:
+  ```bash
+  curl "https://api.telegram.org/bot7540984242:AAHwnXjpUHjmV4bjCeKgTq7YR0_9fVC_OHs/getWebhookInfo"
+  ```
+
+---
+
+## Висновок
+
+Вітаю! Ви створили та розгорнули Telegram-бота на Google Cloud Run. Він готовий приймати анонімні питання, передавати їх адміністраторам і публікувати відповіді в `@christ_qa`. Удачі! 🚀

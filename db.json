@@ -1,0 +1,23 @@
+{
+  "questions": {
+    "q1": {
+      "id": "q1",
+      "category": "urgent",
+      "text": "Скільки разів можна каятись?",
+      "status": "answered",
+      "time": "2025-05-27T00:03:29.281284",
+      "important": true,
+      "user_id": 404389668,
+      "answer": "Багато!",
+      "answer_time": "2025-05-27T00:03:48.351480",
+      "answer_message_id": 57
+    }
+  },
+  "stats": {
+    "total_questions": 1,
+    "answered_questions": 1,
+    "categories": {
+      "urgent": 1
+    }
+  }
+}
